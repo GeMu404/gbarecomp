@@ -105,9 +105,15 @@ const char* trace_kind_name(uint32_t kind) {
 
 }  // namespace
 
+extern "C" void (*g_runtime_write_observer)(uint32_t, uint32_t, uint32_t,
+                                             uint32_t) = nullptr;
+extern "C" volatile int g_runtime_dump_request = 0;
+
 extern "C" void runtime_trace_event(uint32_t kind, uint32_t pc,
                                      uint32_t addr, uint32_t value,
                                      uint32_t aux) {
+    if (g_runtime_write_observer && kind == RUNTIME_TRACE_MEM_WRITE)
+        g_runtime_write_observer(pc, addr, value, aux);
     RuntimeTraceEntry& e = g_trace[g_trace_write];
     e.seq = ++g_trace_seq;
     e.cycles = g_runtime_cycles;

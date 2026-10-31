@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+
+extern "C" volatile int g_runtime_dump_request;  // runtime_arm.cpp
 #include <string>
 #include <vector>
 
@@ -1879,6 +1881,8 @@ HostWindow::Events HostWindow::pump() {
                 int slot = static_cast<int>(sym - SDLK_F1) + 1;
                 if (mods & KMOD_SHIFT) ev.save_slot = slot;
                 else                   ev.load_slot = slot;
+            } else if (sym == SDLK_F10) {
+                g_runtime_dump_request = 1;  // diagnostic one-shot dump
             } else {
                 // Rebindable system hotkeys (config.ini [KeyMap]).
                 for (int h = 0; h < HK_COUNT; ++h) {

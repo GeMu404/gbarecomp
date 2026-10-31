@@ -214,6 +214,12 @@ void            runtime_call_stack_restore(const uint32_t* entries,
 // and RuntimeTraceEntry are defined in runtime_arm_types.h. This records
 // diagnostic state only; it never routes execution or substitutes for
 // missing codegen.
+// Optional diagnostic observer for every traced guest memory write
+// (pc, addr, value, width). nullptr (default) = no cost beyond one test.
+extern "C" void (*g_runtime_write_observer)(uint32_t pc, uint32_t addr,
+                                             uint32_t value, uint32_t width);
+// Set by the host window on F10; a game diagnostic may consume it.
+extern "C" volatile int g_runtime_dump_request;
 void runtime_trace_event(uint32_t kind, uint32_t pc, uint32_t addr,
                          uint32_t value, uint32_t aux);
 void runtime_trace_reset(void);
