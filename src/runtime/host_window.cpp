@@ -1883,6 +1883,7 @@ HostWindow::Events HostWindow::pump() {
                 else                   ev.load_slot = slot;
             } else if (sym == SDLK_F10) {
                 g_runtime_dump_request = 1;  // diagnostic one-shot dump
+                std::fprintf(stderr, "[host] F10: dump requested\n");
             } else {
                 // Rebindable system hotkeys (config.ini [KeyMap]).
                 for (int h = 0; h < HK_COUNT; ++h) {
