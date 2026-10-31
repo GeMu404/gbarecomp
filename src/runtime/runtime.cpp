@@ -685,6 +685,9 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
         } else if (section == "video" && key == "view_width") {
             int n = 0;
             if (parse_int(val.c_str(), &n) && n >= 240) args->view_width = n;
+        } else if (section == "video" &&
+                   (key == "view_height" || key == "aspect")) {
+            // Pre-scanned in run_game(); derives RunOptions view geometry.
         } else if (section == "video" && key == "resize_view") {
             args->resize_view = (val == "true" || val == "1");
         } else if (section == "video" && key == "sharp_filter") {
@@ -1062,7 +1065,28 @@ extern "C" unsigned g_ws_extra_left  = 0;
 extern "C" unsigned g_ws_extra_right = 0;
 extern "C" unsigned g_ws_view_width  = 240;
 
-int run_game(int argc, char** argv, const RunOptions& opts) {
+int run_game(int argc, char** argv, const RunOptions& opts_in) {
+    // Derive the extended view from the game's declared height (game.toml
+    // [video] view_height / aspect). One source of truth for width and
+    // vertical margins; the view stays native 240x160 unless widescreen is on.
+    RunOptions opts = opts_in;
+    {
+        std::string cfg = GBARECOMP_DEFAULT_GAME_CONFIG;
+        for (int i = 1; i + 1 < argc; ++i)
+            if (std::string(argv[i]) == "--config") cfg = argv[i + 1];
+        std::uint32_t aw = 16, ah = 9;
+        const std::uint32_t vh = read_config_view_height(cfg, &aw, &ah);
+        if (vh > kNativeViewHeight) {
+            const DerivedView dv = derive_view_from_height(vh, aw, ah);
+            const auto w = static_cast<std::uint16_t>(dv.width);
+            opts.max_view_width = w;
+            opts.max_resize_view_width = w;
+            opts.widescreen_view_width = w;
+            opts.tall_bottom_anchor = false;
+            opts.view_extra_top = static_cast<std::uint16_t>(dv.extra_top);
+            opts.view_extra_bottom = static_cast<std::uint16_t>(dv.extra_bottom);
+        }
+    }
     // Game runners install this before entering run_game(). Clear it on every
     // return path so a later game launched in the same process cannot call a
     // stale game-specific copied-code dispatcher.
@@ -2318,7 +2342,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 const std::uint32_t requested = runtime_ui_context.view_mode ==
                     RECOMP_RUNTIME_UI_VIEW_FIXED_16_9
                         ? static_cast<std::uint32_t>(std::min<int>(
-                              opts.max_view_width, (160 * 16 + 8) / 9))
+                              opts.max_view_width, opts.widescreen_view_width > 240 ? opts.widescreen_view_width : (160 * 16 + 8) / 9))
                         : 240u;
                 return apply_runtime_view_width(requested);
             }

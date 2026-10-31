@@ -2,9 +2,76 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <fstream>
 #include <limits>
+#include <string>
 
 namespace gbarecomp {
+
+// Native GBA picture. Everything wide/tall is expressed relative to this.
+constexpr std::uint32_t kNativeViewWidth = 240;
+constexpr std::uint32_t kNativeViewHeight = 160;
+
+// Single source of truth for the extended view: the game declares only the
+// height ([video] view_height, e.g. 224 = SNES) and optionally an aspect
+// ([video] aspect = "16:9"). Width = round(height * aw / ah); the extra rows
+// are split evenly above and below the native 160.
+struct DerivedView {
+    std::uint32_t width = kNativeViewWidth;
+    std::uint32_t extra_top = 0;
+    std::uint32_t extra_bottom = 0;
+};
+
+inline DerivedView derive_view_from_height(std::uint32_t height,
+                                           std::uint32_t aspect_w = 16,
+                                           std::uint32_t aspect_h = 9) {
+    DerivedView v;
+    if (height <= kNativeViewHeight || aspect_w == 0 || aspect_h == 0) return v;
+    const std::uint32_t w = (height * aspect_w + aspect_h / 2u) / aspect_h;
+    v.width = std::max(kNativeViewWidth, w);
+    const std::uint32_t extra = height - kNativeViewHeight;
+    v.extra_top = extra / 2u;
+    v.extra_bottom = extra - extra / 2u;
+    return v;
+}
+
+// Minimal pre-scan of [video] view_height / aspect so RunOptions can be
+// derived before the launcher runs. Returns 0 when not declared.
+inline std::uint32_t read_config_view_height(const std::string& path,
+                                             std::uint32_t* aspect_w,
+                                             std::uint32_t* aspect_h) {
+    std::ifstream in(path);
+    if (!in) return 0;
+    std::string line, section;
+    std::uint32_t height = 0;
+    auto trim = [](std::string t) {
+        const auto a = t.find_first_not_of(" \t\r\"");
+        const auto b = t.find_last_not_of(" \t\r\"");
+        return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+    };
+    while (std::getline(in, line)) {
+        const auto hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        line = trim(line);
+        if (line.empty()) continue;
+        if (line.front() == '[') { section = line; continue; }
+        if (section != "[video]") continue;
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = trim(line.substr(0, eq));
+        const std::string val = trim(line.substr(eq + 1));
+        if (key == "view_height") {
+            height = static_cast<std::uint32_t>(std::stoul("0" + val));
+        } else if (key == "aspect" && aspect_w && aspect_h) {
+            const auto c = val.find(':');
+            if (c != std::string::npos) {
+                *aspect_w = static_cast<std::uint32_t>(std::stoul("0" + val.substr(0, c)));
+                *aspect_h = static_cast<std::uint32_t>(std::stoul("0" + val.substr(c + 1)));
+            }
+        }
+    }
+    return height;
+}
 
 struct ViewGeometry {
     std::uint32_t width = 240;
