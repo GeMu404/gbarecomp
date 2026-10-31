@@ -12,6 +12,31 @@ struct ViewGeometry {
     std::uint32_t extra_right = 0;
 };
 
+struct ViewVerticalMargins {
+    std::uint32_t extra_top = 0;
+    std::uint32_t extra_bottom = 0;
+};
+
+// Vertical margins for an already-resolved horizontal view. Matches
+// RunOptions: tall_bottom_anchor → 64/0; else explicit view_extra_*;
+// else legacy 32/32 letterbox. Native (non-expanded) width → 0/0.
+inline ViewVerticalMargins resolve_view_vertical_margins(
+    bool horizontally_expanded,
+    bool tall_bottom_anchor,
+    std::uint16_t view_extra_top,
+    std::uint16_t view_extra_bottom) {
+    if (!horizontally_expanded) {
+        return {};
+    }
+    if (view_extra_top != 0 || view_extra_bottom != 0) {
+        return {view_extra_top, view_extra_bottom};
+    }
+    if (tall_bottom_anchor) {
+        return {64u, 0u};
+    }
+    return {32u, 32u};
+}
+
 inline bool legacy_extra_to_view_width(int extra_per_side, int* width) {
     if (!width || extra_per_side < 0 ||
         extra_per_side > (std::numeric_limits<int>::max() - 240) / 2) {

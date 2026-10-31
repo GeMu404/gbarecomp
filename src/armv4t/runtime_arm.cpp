@@ -57,6 +57,9 @@ extern "C" ArmCpuState g_cpu = {};
 extern "C" RuntimeThumbAluImmediateOverride
     g_runtime_thumb_alu_imm_override = nullptr;
 extern "C" RuntimeBusReadOverride g_runtime_bus_read_override = nullptr;
+// Optional observer for generated stores. One not-taken branch when unset.
+extern "C" void (*g_runtime_mem_write_hook)(uint32_t pc, uint32_t addr,
+                                            uint32_t value, uint32_t width) = nullptr;
 extern "C" RuntimeRamDispatchHook g_runtime_ram_dispatch_hook = nullptr;
 extern "C" RuntimeForceInterpHook g_runtime_force_interp_hook = nullptr;
 extern "C" int g_runtime_force_interp_step_active = 0;
@@ -126,6 +129,9 @@ extern "C" void runtime_trace_event(uint32_t kind, uint32_t pc,
 
     g_trace_write = (g_trace_write + 1u) % kTraceSize;
     if (g_trace_count < kTraceSize) ++g_trace_count;
+
+    if (kind == RUNTIME_TRACE_MEM_WRITE && g_runtime_mem_write_hook)
+        g_runtime_mem_write_hook(pc, addr, value, aux);
 
     static int abort_on_bios_write = -1;
     if (abort_on_bios_write < 0) {

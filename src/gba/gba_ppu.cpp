@@ -2,12 +2,16 @@
 
 #include "gba_ppu.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
 #include "snapshot.h"
+
+extern "C" int smw_ws_mode0_bg_sample(unsigned tile_x, unsigned tile_y,
+                                     std::uint16_t* out);
 
 namespace gba {
 
@@ -33,10 +37,29 @@ extern "C" int g_ws_authored_margin_layers = 0;
 extern "C" int g_ws_pillarbox = 0;
 extern "C" int g_ws_pillarbox_left = 0;
 extern "C" int g_ws_pillarbox_right = 0;
+extern "C" int g_ws_scroll_bias_x = 0;
+extern "C" int g_ws_scroll_bias_y = 0;
+extern "C" int g_ws_cam_correction = 0;
+extern "C" int g_ws_cam_guest_l1 = 0;
+extern "C" int g_ws_view_origin_x = 0;
+extern "C" int g_ws_room_w = 0;
+extern "C" int g_ws_block_top_peek = 0;
+extern "C" int g_ws_player_screen_x = 0;
+extern "C" int g_ws_player_screen_y = 0;
+extern "C" unsigned g_ws_extra_top = 0;
+extern "C" unsigned g_ws_extra_bottom = 0;
+extern "C" int g_ws_status_tile_scrub = 0;
+extern "C" int g_ws_status_ui_pin = 0;
+extern "C" int g_ws_host_obj_compose = 0;  // 1 = world OBJ from host post-latch
 extern "C" int (*g_ws_obj_x_provider)(int, int*) = nullptr;
 extern "C" int (*g_ws_obj_attr_x_provider)(int, std::uint16_t,
                                             std::uint16_t, std::uint16_t,
                                             int*) = nullptr;
+extern "C" int (*g_ws_obj_y_provider)(int, std::uint16_t, int*) = nullptr;
+extern "C" void smw_ws_expire_obj_x(void);
+extern "C" void (*g_ws_post_latch_hook)(std::uint8_t*, std::uint32_t,
+                                         std::uint32_t, std::uint32_t,
+                                         std::uint32_t) = nullptr;
 
 GbaPpu::GbaPpu()  = default;
 GbaPpu::~GbaPpu() = default;
@@ -60,9 +83,11 @@ void GbaPpu::serialize(gbarecomp::debug::SnapshotWriter& w) const {
         constexpr std::size_t kNativeStride = kScreenWidth * 3u;
         const std::size_t wide_stride = render_width() * 3u;
         const std::size_t center_x = extra_left_ * 3u;
+        const std::size_t center_y0 = extra_top_;
         for (std::size_t y = 0; y < kScreenHeight; ++y) {
             std::memcpy(center.data() + y * kNativeStride,
-                        latched_fb_.data() + y * wide_stride + center_x,
+                        latched_fb_.data() +
+                            (y + center_y0) * wide_stride + center_x,
                         kNativeStride);
         }
         w.bytes(center.data(), center.size());
@@ -100,8 +125,10 @@ void GbaPpu::deserialize(gbarecomp::debug::SnapshotReader& r) {
         constexpr std::size_t kNativeStride = kScreenWidth * 3u;
         const std::size_t wide_stride = render_width() * 3u;
         const std::size_t center_x = extra_left_ * 3u;
+        const std::size_t center_y0 = extra_top_;
         for (std::size_t y = 0; y < kScreenHeight; ++y) {
-            std::memcpy(work_fb_.data() + y * wide_stride + center_x,
+            std::memcpy(work_fb_.data() +
+                            (y + center_y0) * wide_stride + center_x,
                         native_latch.data() + y * kNativeStride,
                         kNativeStride);
         }
@@ -132,9 +159,7 @@ void GbaPpu::reset() {
 
 void GbaPpu::set_view_margins(uint32_t left, uint32_t right,
                               uint32_t top, uint32_t bottom) {
-    // Clamp each side to its compile-time max. kMaxExtraY is 0 for now, so
-    // top/bottom are forced to 0 (vertical expansion deferred) — the params
-    // stay in the API so callers remain generic.
+    // Clamp each side to its compile-time max.
     const uint32_t next_left = left > kMaxExtraX ? kMaxExtraX : left;
     const uint32_t next_right = right > kMaxExtraX ? kMaxExtraX : right;
     const uint32_t next_top = top > kMaxExtraY ? kMaxExtraY : top;
@@ -150,6 +175,8 @@ void GbaPpu::set_view_margins(uint32_t left, uint32_t right,
     extra_right_ = next_right;
     extra_top_ = next_top;
     extra_bottom_ = next_bottom;
+    g_ws_extra_top = extra_top_;
+    g_ws_extra_bottom = extra_bottom_;
 }
 
 GbaPpu::TickEvents GbaPpu::tick(uint32_t cycles, uint16_t vcount_compare) {
@@ -233,6 +260,10 @@ inline void to_rgb888(uint16_t c, uint8_t* out) {
     out[2] = static_cast<uint8_t>((b << 3) | (b >> 2));
 }
 
+inline uint16_t load_u16_le(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0] | (p[1] << 8));
+}
+
 inline uint16_t blend_alpha_gba555(uint16_t top,
                                    uint16_t bottom,
                                    uint32_t eva,
@@ -277,10 +308,6 @@ inline uint16_t darken_gba555(uint16_t color, uint32_t evy) {
     g6 -= (g6 * evy + 7u) >> 4;
     b -= (b * evy + 7u) >> 4;
     return static_cast<uint16_t>((b << 10) | ((g6 >> 1) << 5) | r);
-}
-
-inline uint16_t load_u16_le(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0] | (p[1] << 8));
 }
 
 }  // namespace
@@ -940,27 +967,31 @@ void render_scanline_internal(uint8_t* rgb,
 }
 
 // ── Wide (view-expanded) scanline compositor ────────────────────────────────
-// Renders output scanline `y` into an `out_w`-pixel row, where output column x
-// maps to hardware column hx = x - ox (ox = left margin). This path is ONLY
-// entered when view-area expansion is active; the faithful build always takes
-// render_scanline_internal above, so OFF-mode stays byte-identical by construc-
-// tion. For central hx in [0,240) the per-pixel logic is the same as vanilla;
-// margin columns extend the BG scroll / affine extrapolation / OBJ sampling into
-// the surrounding map. WIN0/WIN1 register tests are NOT widened — a margin hx
-// falls outside [X1,X2) so it naturally resolves to WINOUT (the conservative
-// policy for columns the game never authored). OAM X keeps its 9-bit signed
-// decode and is tested against the expanded viewport, so wrapped-negative sprites
-// (left) and x>=240 sprites (right) both appear in the margins. Vertical is not
-// expanded here (extra_top/bottom are forced 0), so `y` is the hardware scanline.
-void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
+// Renders output row `oy` using continuous hardware Y `hy` (= oy - extra_top).
+// Output column x maps to hardware column hx = x - ox (ox = left margin).
+// This path is ONLY entered when view-area expansion is active; the faithful
+// build always takes render_scanline_internal above. For central hx in [0,240)
+// the per-pixel logic matches vanilla; margin columns extrapolate BG/OBJ.
+// WIN0/WIN1 H tests are not widened. Vertical: hy may be <0 or >=160 for peek
+// / under-floor rows painted at VBlank; live HBlank still uses hy = vcount.
+void render_scanline_wide(uint8_t* rgb, uint32_t oy, int32_t hy,
+                          uint16_t dispcnt,
                           const uint8_t* io, const uint8_t* vram,
                           const uint8_t* oam, const uint8_t* pal,
                           uint32_t out_w, uint32_t ox) {
+    // Layer1 is the left of this view. The follow measures the stock
+    // point from Layer1 + extra, so gameplay samples 1:1 (ox = 0).
+    // Title pillarbox still uses the margin. Columns left of the level
+    // are skipped.
     constexpr uint32_t kVanW = GbaPpu::kScreenWidth;   // 240
-    constexpr uint32_t kVanH = GbaPpu::kScreenHeight;  // 160
-    if (y >= kVanH) return;
+    constexpr uint32_t kVanH = GbaPpu::kScreenHeight;  // 160 — native window V
+    // oy is the framebuffer row; hy is continuous hardware Y (oy - extra_top).
+    // Peek / under-floor rows use hy ∉ [0,160); native HBlank still uses hy = vcount.
 
-    uint8_t* row = rgb + y * out_w * 3;
+    if (!g_ws_pillarbox && !g_ws_pillarbox_left && !g_ws_pillarbox_right)
+        ox = 0;
+
+    uint8_t* row = rgb + static_cast<std::size_t>(oy) * out_w * 3;
     if (dispcnt & 0x0080u) { std::memset(row, 0xFF, out_w * 3); return; }
 
     struct PixelCandidate {
@@ -979,11 +1010,43 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     const bool any_window = win0_en || win1_en || objwin_en;
     uint16_t winin  = static_cast<uint16_t>(io[0x48] | (io[0x49] << 8));
     uint16_t winout = static_cast<uint16_t>(io[0x4A] | (io[0x4B] << 8));
+    // The status plate is a screen-fixed layer. Its origin on the tall
+    // view is the top row, centered on the 240 it was authored for.
+    // A window that covers the native glass still covers the rows above
+    // it, so the level there keeps drawing.
+    const bool place_status =
+        g_ws_extra_top != 0 && !g_ws_pillarbox &&
+        !g_ws_pillarbox_left && !g_ws_pillarbox_right;
+    const int status_x = place_status
+        ? static_cast<int>((out_w - kVanW) / 2u)
+        : 0;
+    // The plate was one 240-wide strip. Lives and the score are its left
+    // end, coins and the points its right end, and the star, the item box
+    // and TIME sit between them. On the wide view the two ends go to the
+    // edges and the middle stays on the center line.
+    constexpr int kStatusLeftEnd = 50;
+    constexpr int kStatusRightBegin = 180;
+    auto status_native_x = [&](int x) -> int {
+        if (!place_status) return x;
+        if (x < kStatusLeftEnd) return x;
+        const int right_out = static_cast<int>(out_w) - (static_cast<int>(kVanW) - kStatusRightBegin);
+        if (x >= right_out) return kStatusRightBegin + (x - right_out);
+        const int n = x - status_x;
+        if (n >= kStatusLeftEnd && n < kStatusRightBegin) return n;
+        return -1;
+    };
     auto win_v_row = [&](uint32_t vreg) -> bool {
         uint32_t v  = static_cast<uint32_t>(io[vreg] | (io[vreg + 1] << 8));
-        uint32_t y1 = (v >> 8) & 0xFFu, y2 = v & 0xFFu;
-        if (y2 > kVanH || y1 > y2) y2 = kVanH;
-        return y >= y1 && y < y2;
+        int y1 = static_cast<int>((v >> 8) & 0xFFu);
+        int y2 = static_cast<int>(v & 0xFFu);
+        // y2 == 0, or a bottom past the glass, is the bottom edge.
+        if (y2 == 0 || y2 > static_cast<int>(kVanH) || y1 > y2)
+            y2 = static_cast<int>(kVanH);
+        if (y1 == 0)
+            y1 = -static_cast<int>(g_ws_extra_top);
+        if (y2 >= static_cast<int>(kVanH))
+            y2 = static_cast<int>(kVanH) + static_cast<int>(g_ws_extra_bottom);
+        return hy >= y1 && hy < y2;
     };
     auto win_h_in = [&](uint32_t hreg, int hx) -> bool {
         uint32_t h  = static_cast<uint32_t>(io[hreg] | (io[hreg + 1] << 8));
@@ -997,9 +1060,9 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     // outside [0,240)) get no OBJ-window (WINOUT), consistent with WIN0/1.
     bool obj_window_storage[GbaPpu::kScreenWidth] = {};
     bool* obj_window_mask = nullptr;
-    if (objwin_en) {
-        mark_obj_window_scanline(obj_window_storage, y, dispcnt, vram, oam,
-                                 kVanW, kVanH);
+    if (objwin_en && hy >= 0 && hy < static_cast<int32_t>(kVanH)) {
+        mark_obj_window_scanline(obj_window_storage, static_cast<uint32_t>(hy),
+                                 dispcnt, vram, oam, kVanW, kVanH);
         obj_window_mask = obj_window_storage;
     }
     auto window_control_at_hx = [&](int hx) -> uint16_t {
@@ -1036,8 +1099,12 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             // Minish's room provider treats expanded columns as lying outside
             // every native WIN0/WIN1 rectangle, so WINOUT controls the world
             // there. Other providers retain the established fail-closed rule.
+            // SMW/map WINOUT has no BG bits — extend the uniform in-window
+            // control into margins when authored, else fail-closed.
             if (g_ws_authored_margin_layers)
-                return window_control_at_hx(hx);
+                return window_control_is_uniform
+                    ? uniform_window_control
+                    : window_control_at_hx(hx);
             return window_control_is_uniform ? uniform_window_control : 0u;
         }
         return window_control_at_hx(hx);
@@ -1046,7 +1113,9 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     // same output column. Resolve them once per scanline instead of repeating
     // WIN0/WIN1/OBJ-window branches for the backdrop, every BG, and every OBJ
     // pixel. The fixed-size stack array covers the renderer's clamped width.
-    uint8_t window_controls[GbaPpu::kMaxRenderWidth];
+    // These rows are ~16KB. On the guest stack that overflows after a few
+    // minutes and the process dies with SIGSEGV. Keep them off that stack.
+    static thread_local uint8_t window_controls[GbaPpu::kMaxRenderWidth];
     for (uint32_t x = 0; x < out_w; ++x)
         window_controls[x] = static_cast<uint8_t>(window_control(x) & 0x3Fu);
     auto layer_enabled = [&](uint32_t x, uint32_t layer_bit) -> bool {
@@ -1062,8 +1131,8 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     uint32_t second_targets = (bldcnt >> 8) & 0x3Fu;
     uint32_t effect = (bldcnt >> 6) & 0x3u;
 
-    PixelCandidate top[GbaPpu::kMaxRenderWidth];
-    PixelCandidate second[GbaPpu::kMaxRenderWidth];
+    static thread_local PixelCandidate top[GbaPpu::kMaxRenderWidth];
+    static thread_local PixelCandidate second[GbaPpu::kMaxRenderWidth];
     const uint16_t backdrop_color = load_u16_le(&pal[0]);
     uint8_t backdrop_rgb[3];
     to_rgb888(backdrop_color, backdrop_rgb);
@@ -1077,6 +1146,8 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         top[x].target1 = blend_enabled(x) && ((first_targets & (1u << 5)) != 0);
         top[x].target2 = (second_targets & (1u << 5)) != 0;
         top[x].valid = true;
+        second[x].key = 0x7FFFFFFF;
+        second[x].valid = false;
     }
     auto submit = [&](uint32_t x, uint16_t color, int key, uint8_t layer,
                       bool target1, bool target2) {
@@ -1106,34 +1177,80 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             io[scroll_off] | (io[scroll_off + 1] << 8)) & 0x01FFu;
         uint32_t vofs = static_cast<uint16_t>(
             io[scroll_off + 2] | (io[scroll_off + 3] << 8)) & 0x01FFu;
+        // One inset for every layer, shared with sprites below.
+        const int layer_ox = static_cast<int>(ox);
+        // HOFS stays the guest scroll. With ox = 0 that is the view.
+        const int32_t hofs_i = static_cast<int32_t>(hofs);
+        const int32_t vofs_i =
+            static_cast<int32_t>(vofs) + g_ws_scroll_bias_y;
         uint32_t width_tiles = (size_code & 1u) ? 64u : 32u;
         uint32_t height_tiles = (size_code & 2u) ? 64u : 32u;
         uint32_t width_px = width_tiles * 8u;
         uint32_t height_px = height_tiles * 8u;
         uint32_t block_cols = width_tiles / 32u;
+        // In a level the status plate is the screen-fixed layer: priority 0,
+        // char base 1, screen base 28 (BGCNT 0xDC44). Its top band is the
+        // bar. That band is drawn once, kStatusTopMargin rows below the top
+        // of the tall view, split to the edges. Guest lines 0..kStatusBand
+        // are that same bar; leaving them in place paints a second copy
+        // over the level. Lines under that stay on the camera and the
+        // window, so the water keeps its own position and is not split.
+        // The overworld frame uses that same BGCNT. Room width is 0 off a
+        // level, so none of this runs there.
+        const bool status_bg = place_status &&
+            g_ws_room_w > 0 &&
+            screen_base == 28u * 0x800u &&
+            char_base == 0x4000u &&
+            bg_priority == 0;
+        const int oy = hy + static_cast<int>(g_ws_extra_top);
+        const int plate_y = oy - kStatusTopMargin;
+        const bool status_layer = status_bg &&
+            plate_y >= 0 && plate_y < kStatusBand;
+        if (status_bg && !status_layer && hy >= 0 && hy < kStatusBand)
+            return;
+        // Rows above the camera are part of the tall view. A negative
+        // sample is backdrop; wrapping that sample would pull the floor up.
         for (uint32_t x = 0; x < out_w; ++x) {
-            int hx = static_cast<int>(x) - static_cast<int>(ox);
-            const bool authored_margin = g_ws_authored_margin_layers &&
+            int hx = static_cast<int>(x) - layer_ox;
+            const bool authored_margin = !status_layer &&
+                g_ws_authored_margin_layers &&
                 (hx < 0 || hx >= static_cast<int>(kVanW));
             // Minish supplies room-map entries for margins independently of
             // the native 240px WIN0/WIN1 HUD/dialog masks. Ignore only their
             // regular-BG layer gate there; unsupported UI BGs still fail in
             // the provider below, so they cannot repeat.
-            if (!layer_enabled(x, layer) && !authored_margin) continue;
+            // The status ends now sit outside the native window. The plate
+            // is screen-fixed, so the window does not get to hide them.
+            if (!status_layer && !layer_enabled(x, layer) && !authored_margin) continue;
             int sample_hx = hx;
-            if (g_ws_bg_x_provider &&
+            int32_t tex_y_i = hy + vofs_i;
+            if (status_layer) {
+                sample_hx = status_native_x(static_cast<int>(x));
+                if (sample_hx < 0 || sample_hx >= static_cast<int>(kVanW))
+                    continue;
+                tex_y_i = plate_y + static_cast<int32_t>(vofs);
+            } else if (g_ws_bg_x_provider &&
                 (g_ws_bg_x_provider_layers & (1u << layer))) {
                 int provided_hx = hx;
                 const int action = g_ws_bg_x_provider(
                     static_cast<int>(layer), static_cast<int>(x),
-                    static_cast<int>(y), &provided_hx);
+                    hy, &provided_hx);
                 if (action < 0) continue;
                 if (action > 0) sample_hx = provided_hx;
             }
-            uint32_t tex_x = static_cast<uint32_t>(
-                                 sample_hx + static_cast<int>(hofs)) &
+            // Past the left or the top of the map: leave the backdrop.
+            // Wrapping those samples pulls the far edge of the tilemap in.
+            const int32_t world_x = sample_hx + hofs_i;
+            if (world_x < 0) continue;
+            uint32_t tex_x = static_cast<uint32_t>(world_x) &
                              (width_px - 1u);
-            uint32_t tex_y = (y + vofs) & (height_px - 1u);
+            // Same rule as X. A negative coordinate is backdrop. The
+            // rest of the map, including the rows above the glass, uses
+            // this line's scroll. A second reject up there slices a
+            // platform whose top sits in those rows.
+            if (tex_y_i < 0) continue;
+            uint32_t tex_y =
+                static_cast<uint32_t>(tex_y_i) & (height_px - 1u);
             uint32_t tile_x = tex_x >> 3;
             uint32_t tile_y = tex_y >> 3;
             uint32_t block = (tile_x >> 5) + (tile_y >> 5) * block_cols;
@@ -1141,6 +1258,19 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                 ((tile_y & 31u) * 32u + (tile_x & 31u)) * 2u;
             if (map_off + 1 >= 96u * 1024u) continue;
             uint16_t entry = load_u16_le(&vram[map_off]);
+            // The level DMA writes one 256px screen at this base (080131C6).
+            // Tile 0 and 0xF8 in that screen are real: 0 is the cave gap,
+            // 0xF8 is a tileset cell. Replacing them paints the comb in
+            // 080E0B58 across Donut Plains 2. Only the next screen, which
+            // that DMA does not fill, is read from the decompressed map.
+            if (screen_base == 0xC000u && tile_x >= 32u) {
+                const uint32_t tn = entry & 0x03FFu;
+                if (tn == 0u || tn == 0xF8u) {
+                    uint16_t ext = 0;
+                    if (smw_ws_mode0_bg_sample(tile_x, tile_y, &ext))
+                        entry = ext;
+                }
+            }
             // Widescreen margin (hardware column outside 0..239): the 256px ring
             // entry here is the wrapped/aliased seam. If the sidecar can supply
             // the true off-screen world tile, use it; if it's armed but has no
@@ -1151,7 +1281,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                     uint16_t ext;
                     const int action = g_ws_tilemap_provider(
                         static_cast<int>(layer), sample_hx,
-                        static_cast<int>(y), &ext);
+                        hy, &ext);
                     if (action == kWsTilemapReplace) {
                         entry = ext;
                     } else if (action != kWsTilemapKeepWrapped) {
@@ -1208,15 +1338,15 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         int32_t refy = read_s28_ref(io, param_off + 0x0C);
         // Extrapolate from the scanline reference using the signed logical x:
         // output column 0 is hardware x = -ox, so pre-advance by (-ox)*PA/PC.
-        int32_t xt = refx + static_cast<int32_t>(y) * pb +
+        int32_t xt = refx + hy * pb +
                      static_cast<int32_t>(-static_cast<int>(ox)) * pa;
-        int32_t yt = refy + static_cast<int32_t>(y) * pd +
+        int32_t yt = refy + hy * pd +
                      static_cast<int32_t>(-static_cast<int>(ox)) * pc;
         const bool filter =
             g_ws_affine_filter_enabled &&
             g_ws_affine_filter_provider &&
             g_ws_affine_filter_provider(
-                static_cast<int>(layer), static_cast<int>(y));
+                static_cast<int>(layer), hy);
         auto sample_color = [&](int32_t tex_x, int32_t tex_y,
                                 uint16_t* out_color) -> bool {
             if (wrap) {
@@ -1314,9 +1444,9 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         int32_t pd   = read_s16(io, 0x26);
         int32_t refx = read_s28_ref(io, 0x28);
         int32_t refy = read_s28_ref(io, 0x2C);
-        int32_t xt = refx + static_cast<int32_t>(y) * pb +
+        int32_t xt = refx + hy * pb +
                      static_cast<int32_t>(-static_cast<int>(ox)) * pa;
-        int32_t yt = refy + static_cast<int32_t>(y) * pd +
+        int32_t yt = refy + hy * pd +
                      static_cast<int32_t>(-static_cast<int>(ox)) * pc;
         for (uint32_t x = 0; x < out_w; ++x) {
             int32_t tex_x = xt >> 8;
@@ -1362,7 +1492,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         render_bitmap_bg();
     }
 
-    if (dispcnt & 0x1000u) {
+    if ((dispcnt & 0x1000u) && !g_ws_host_obj_compose) {
         constexpr uint32_t obj_tile_base = 0x10000u;
         bool obj_1d_mapping = (dispcnt & 0x0040u) != 0;
         const uint8_t* obj_pal = pal + 0x200;
@@ -1386,7 +1516,52 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             // values that its widened guest writer emitted beyond hardware X.
             const int raw_sx = static_cast<int>(attr1 & 0x1FFu);
             int sx = raw_sx;
-            if (sy >= 160) sy -= 256;
+            // Y 160..255 folds to -96..-1. That is both a sprite clipping
+            // the top of the glass and an object that fell past the floor.
+            bool noted_y = false;
+            if (g_ws_obj_y_provider &&
+                g_ws_obj_y_provider(idx, attr0, &sy)) {
+                // Full signed screen Y. Do not fold it at 160.
+                noted_y = true;
+            } else if (sy >= 160) {
+                // 176..255 is a row above the glass (byte of a negative
+                // Y). 160..175 is that same byte for a row just above the
+                // picture, and also the band under the glass. The band
+                // under the glass is extra_bottom rows; draw those. The
+                // free-slot park is Y=160, X=0, tile 0, and that tile is
+                // the face.
+                const int above = 256 - static_cast<int>(g_ws_extra_top);
+                const int bottom = 160 + static_cast<int>(g_ws_extra_bottom);
+                if (sy >= above) sy -= 256;
+                else if (sy < bottom) {
+                    const unsigned tile = attr2 & 0x3FFu;
+                    if (sy == 160 && raw_sx == 0 && tile == 0u) continue;
+                } else {
+                    continue;
+                }
+            }
+            const int box_h = (rot_scale && disable_or_double) ? sh * 2 : sh;
+            // The rows above the glass are part of the picture. A sprite
+            // whose box sits entirely in them still draws. The same byte
+            // is Mario once his real screen Y has gone past the floor;
+            // that one stays under it.
+            if (sy + box_h <= 0) {
+                const int peek = static_cast<int>(g_ws_extra_top);
+                // 192 is the guest's hide, not a sprite sitting on the
+                // top row. A real row above the glass comes in as a note.
+                if (!noted_y && (attr0 & 0xFFu) == 0xC0u) continue;
+                // Drop the sprite only when its whole box is above the
+                // picture. A tall sprite that starts above the extra rows
+                // and ends inside them still draws, same as a map tile.
+                if (peek <= 0 || sy + box_h <= -peek) continue;
+                if (!noted_y && g_ws_player_screen_y >= 160) {
+                    int wrapped = g_ws_player_screen_y & 0xFF;
+                    if (wrapped >= 128) wrapped -= 256;
+                    if (sy >= wrapped - 40 && sy <= wrapped + 16) continue;
+                }
+            }
+            if (!(sy >= 0 && sy < 80))
+                sy -= g_ws_scroll_bias_y;
             auto resolve_sx = [&] {
                 int provided_sx = sx;
                 if (g_ws_obj_attr_x_provider &&
@@ -1419,7 +1594,9 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             bool obj_target2 = (second_targets & (1u << 4)) != 0;
             auto emit_obj = [&](int tex_x, int tex_y, int screen_x) {
                 if (screen_x < 0 || screen_x >= static_cast<int>(out_w)) return;
-                if (!layer_enabled(static_cast<uint32_t>(screen_x), 4)) return;
+                // The glass window ends at the old top. Rows above it are
+                // the tall view; objects draw there with the tiles.
+                if (hy >= 0 && !layer_enabled(static_cast<uint32_t>(screen_x), 4)) return;
                 int tile_x_in_sprite = tex_x >> 3;
                 int tile_y_in_sprite = tex_y >> 3;
                 int px_in_tile = tex_x & 7;
@@ -1455,7 +1632,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             if (rot_scale) {
                 int bw = disable_or_double ? sw * 2 : sw;
                 int bh = disable_or_double ? sh * 2 : sh;
-                int j = static_cast<int>(y) - sy;
+                int j = hy - sy;
                 if (j < 0 || j >= bh) continue;
                 resolve_sx();
                 int affine_group = (attr1 >> 9) & 0x1Fu;
@@ -1479,7 +1656,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                 }
                 continue;
             }
-            int line = static_cast<int>(y) - sy;
+            int line = hy - sy;
             if (line < 0 || line >= sh) continue;
             resolve_sx();
             bool hflip = (attr1 & 0x1000u) != 0;
@@ -1512,7 +1689,11 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         // screens so menus/battles are letterboxed, not garbled.
         const bool left_margin = x < ox;
         const bool right_margin = x >= ox + 240u;
-        if ((black_nonuniform_window_margins &&
+        const bool past_room =
+            g_ws_room_w > 0 &&
+            (g_ws_view_origin_x + static_cast<int>(x) >= g_ws_room_w);
+        if (past_room ||
+            (black_nonuniform_window_margins &&
              (left_margin || right_margin)) ||
             (!palette_backdrop_only &&
              ((g_ws_pillarbox && (left_margin || right_margin)) ||
@@ -1561,12 +1742,22 @@ void GbaPpu::render(uint8_t* rgb,
             render_scanline_internal(rgb, y, dispcnt, io, vram, oam, pal,
                                      kScreenWidth, kScreenHeight);
         }
+        smw_ws_expire_obj_x();
         return;
     }
     const uint32_t ow = render_width();
-    for (uint32_t y = 0; y < kScreenHeight; ++y) {
-        render_scanline_wide(rgb, y, dispcnt, io, vram, oam, pal, ow, extra_left_);
+    const uint32_t oh = render_height();
+    // Continuous bottom-anchor: oy = hy + extra_top for every hy (peek and
+    // native). Floor stays at the bottom; peek is real map above the camera.
+    // Do NOT splice HUD/world scanlines — that shears the BG. HUD must move
+    // as its own positioned elements, not by remapping the world FB.
+    for (uint32_t oy = 0; oy < oh; ++oy) {
+        const int32_t hy = static_cast<int32_t>(oy) -
+                           static_cast<int32_t>(extra_top_);
+        render_scanline_wide(rgb, oy, hy, dispcnt, io, vram, oam, pal,
+                             ow, extra_left_);
     }
+    smw_ws_expire_obj_x();
 }
 
 #if 0
@@ -1862,14 +2053,92 @@ void GbaPpu::render_scanline(uint32_t y,
         state.y += pd;
     }
 
+    if (y == 0) {
+        std::memcpy(line0_io_.data(), io, line0_io_.size());
+        line0_io_valid_ = true;
+        play_io_valid_ = false;
+    }
+    // Two metatiles under the status band. This line's scroll is the camera.
+    if (y == 32u) {
+        std::memcpy(play_io_.data(), io, play_io_.size());
+        play_io_valid_ = true;
+    }
     if (!view_expanded()) {
         render_scanline_internal(work_fb_.data(), y, dispcnt,
                                  affine_io.data(), vram, oam, pal,
                                  kScreenWidth, kScreenHeight);
         return;
     }
-    render_scanline_wide(work_fb_.data(), y, dispcnt, affine_io.data(),
-                         vram, oam, pal, render_width(), extra_left_);
+    // Live HBlank: native line y → FB row y+extra_top (bottom-anchored).
+    const uint32_t oy = y + extra_top_;
+    render_scanline_wide(work_fb_.data(), oy, static_cast<int32_t>(y),
+                         dispcnt, affine_io.data(), vram, oam, pal,
+                         render_width(), extra_left_);
+}
+
+void GbaPpu::paint_vertical_margins(uint16_t dispcnt,
+                                    const uint8_t* io,
+                                    const uint8_t* vram,
+                                    const uint8_t* oam,
+                                    const uint8_t* pal) {
+    if (!view_expanded() || (extra_top_ == 0 && extra_bottom_ == 0)) return;
+    const uint32_t ow = render_width();
+    // Peek (hy < 0) and under-floor (hy >= 160): same continuous mapping.
+    // Peek samples real scroll/map; g_ws_block_top_peek blocks inventing
+    // wrapped floor tiles when the camera is already at the map top.
+    // VBlank still holds the last line: the fall darken (BLDY) and the
+    // bottom scroll. The rows above the glass continue line 0, where that
+    // void is not applied.
+    std::array<uint8_t, 0x60> peek_io{};
+    const uint8_t* peek = io;
+    uint16_t peek_dispcnt = dispcnt;
+    if (line0_io_valid_) {
+        // Line 0's blend, so the fall void is not painted across the sky.
+        // Its scroll is the status row, not the camera. Keep the blend and
+        // put the playfield layers back on the camera, or the rows above
+        // the glass read the top of the tilemap: two metatiles of junk when
+        // the camera is up there, and a missing platform when it is not.
+        std::memcpy(peek_io.data(), line0_io_.data(), peek_io.size());
+        if (play_io_valid_) {
+            for (unsigned bg = 0; bg < 4u; ++bg) {
+                const unsigned cnt = 0x08u + bg * 2u;
+                const uint16_t bgcnt = static_cast<uint16_t>(
+                    peek_io[cnt] | (static_cast<uint16_t>(peek_io[cnt + 1]) << 8));
+                const uint32_t char_base = ((bgcnt >> 2) & 3u) * 0x4000u;
+                const uint32_t screen_base = ((bgcnt >> 8) & 0x1Fu) * 0x800u;
+                const bool status = g_ws_room_w > 0 &&
+                                    screen_base == 28u * 0x800u &&
+                                    char_base == 0x4000u &&
+                                    (bgcnt & 3u) == 0u;
+                if (status) continue;
+                const unsigned off = 0x10u + bg * 4u;
+                std::memcpy(peek_io.data() + off, play_io_.data() + off, 4u);
+            }
+        }
+        peek = peek_io.data();
+        peek_dispcnt = static_cast<uint16_t>(
+            peek_io[0] | (static_cast<uint16_t>(peek_io[1]) << 8));
+    }
+    for (uint32_t oy = 0; oy < extra_top_; ++oy) {
+        const int32_t hy = static_cast<int32_t>(oy) -
+                           static_cast<int32_t>(extra_top_);
+        render_scanline_wide(work_fb_.data(), oy, hy, peek_dispcnt, peek,
+                             vram, oam, pal, ow, extra_left_);
+    }
+    for (uint32_t i = 0; i < extra_bottom_; ++i) {
+        const uint32_t oy = extra_top_ + kScreenHeight + i;
+        const int32_t hy = static_cast<int32_t>(kScreenHeight + i);
+        render_scanline_wide(work_fb_.data(), oy, hy, dispcnt, io, vram, oam,
+                             pal, ow, extra_left_);
+    }
+}
+
+void GbaPpu::apply_status_ui_pin(uint16_t /*dispcnt*/,
+                                 const uint8_t* /*io*/,
+                                 const uint8_t* /*vram*/,
+                                 const uint8_t* /*oam*/,
+                                 const uint8_t* /*pal*/) {
+    // Disabled: scanline pin shears BG. SMW uses host stamp-detach instead.
 }
 
 void GbaPpu::note_affine_reference_write(unsigned bg, bool y_axis) {
@@ -1891,6 +2160,10 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
 void GbaPpu::mark_framebuffer_latched() {
     std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
     has_latched_fb_ = true;
+    if (g_ws_post_latch_hook) {
+        g_ws_post_latch_hook(latched_fb_.data(), render_width(),
+                             render_height(), extra_left_, extra_top_);
+    }
 }
 
 }  // namespace gba

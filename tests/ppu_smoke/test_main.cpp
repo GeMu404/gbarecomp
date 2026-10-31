@@ -171,9 +171,16 @@ void test_extended_view_geometry_and_clamp() {
 
     ppu.set_view_margins(1000, 1000, 7, 9);
     if (ppu.render_width() != gba::GbaPpu::kMaxRenderWidth ||
-        ppu.render_height() != gba::GbaPpu::kScreenHeight ||
-        ppu.view_extra_top() != 0 || ppu.view_extra_bottom() != 0) {
-        std::fprintf(stderr, "extended-view clamp mismatch\n");
+        ppu.view_extra_top() != 7 || ppu.view_extra_bottom() != 9 ||
+        ppu.render_height() != gba::GbaPpu::kScreenHeight + 7 + 9) {
+        std::fprintf(stderr, "extended-view vertical margin mismatch\n");
+        std::exit(1);
+    }
+    ppu.set_view_margins(1000, 1000, 1000, 1000);
+    if (ppu.view_extra_top() != gba::GbaPpu::kMaxExtraY ||
+        ppu.view_extra_bottom() != gba::GbaPpu::kMaxExtraY ||
+        ppu.render_height() != gba::GbaPpu::kMaxRenderHeight) {
+        std::fprintf(stderr, "extended-view vertical clamp mismatch\n");
         std::exit(1);
     }
 }

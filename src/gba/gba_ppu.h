@@ -98,17 +98,16 @@ public:
     // so OFF-mode is byte-identical to the faithful build BY CONSTRUCTION — not
     // by algebraic equivalence (per the widescreen design review). Horizontal
     // widening reuses each scanline's latched register state; VERTICAL widening
-    // would have to invent state for nonexistent scanlines (no VCOUNT / HBlank
-    // DMA / affine-ref / WIN_V), so kMaxExtraY is compile-capped at 0 for now —
-    // the API still accepts top/bottom (clamped to 0) so callers stay generic.
+    // invents peek/under-floor rows (hy = oy - extra_top) with the same
+    // compositor. kMaxExtraY caps per-side peek.
     // These margins are present-time host state and are NEVER serialized into
     // the snapshot (the save format is unchanged).
     // Experimental horizontal envelope: 120 pixels per side gives an exact
     // 480x160 maximum while the default remains the literal 240x160 path.
     static constexpr uint32_t kMaxExtraX = 120;
-    static constexpr uint32_t kMaxExtraY = 0;    // vertical deferred; bump when invented-scanline path lands
+    static constexpr uint32_t kMaxExtraY = 80;
     static constexpr uint32_t kMaxRenderWidth  = kScreenWidth  + 2u * kMaxExtraX;  // 480
-    static constexpr uint32_t kMaxRenderHeight = kScreenHeight + 2u * kMaxExtraY;  // 160
+    static constexpr uint32_t kMaxRenderHeight = kScreenHeight + 2u * kMaxExtraY;  // 320
     static constexpr std::size_t kMaxFramebufferBytes =
         static_cast<std::size_t>(kMaxRenderWidth) * kMaxRenderHeight * 3;
 
@@ -142,6 +141,22 @@ public:
                          const uint8_t* vram,
                          const uint8_t* oam,
                          const uint8_t* pal);
+
+    // Invent peek / under-floor rows (hy∉[0,160)) into work_fb_. Call once
+    // per frame at VBlank start before mark_framebuffer_latched().
+    void paint_vertical_margins(uint16_t dispcnt,
+                                const uint8_t* io,
+                                const uint8_t* vram,
+                                const uint8_t* oam,
+                                const uint8_t* pal);
+
+    // After continuous / HBlank compose: pin guest status hy∈[0,band) to
+    // oy=hy and refill mid from peek. Operates on work_fb_.
+    void apply_status_ui_pin(uint16_t dispcnt,
+                             const uint8_t* io,
+                             const uint8_t* vram,
+                             const uint8_t* oam,
+                             const uint8_t* pal);
 
     // The affine reference registers have an internal scanline accumulator.
     // Any write to BG2X/Y or BG3X/Y reloads that accumulator immediately;
@@ -191,6 +206,17 @@ private:
         bool reload_y = false;
     };
     std::array<AffineLineState, 2> affine_line_{};
+    // HDMA walks blend and scroll down the 160 lines. By VBlank, BLDY holds
+    // the darkness of the last line — the fall void. The rows above the
+    // glass keep line 0's image, or that void is painted across the sky.
+    std::array<uint8_t, 0x60> line0_io_{};
+    bool line0_io_valid_ = false;
+    // Line 0 is the status row. Its BG scroll is not the camera: the tall
+    // peek was sampling that row, so the top two metatiles wrapped to junk
+    // and a platform sitting just above the glass never landed on its tiles.
+    // Captured once the scan is past that band.
+    std::array<uint8_t, 0x60> play_io_{};
+    bool play_io_valid_ = false;
 
     // View-area margins (present-time host state; NOT serialized — see above).
     uint32_t extra_left_   = 0;
@@ -232,6 +258,35 @@ extern "C" int g_ws_authored_margin_layers;
 extern "C" int g_ws_pillarbox;  // Step C policy: black margins on non-field screens
 extern "C" int g_ws_pillarbox_left;
 extern "C" int g_ws_pillarbox_right;
+extern "C" int g_ws_scroll_bias_x;
+extern "C" int g_ws_scroll_bias_y;
+// Guest Layer1 minus the held lock. The wide renderer pulls the picture back
+// onto that line; 0 leaves the guest scroll alone.
+extern "C" int g_ws_cam_correction;
+extern "C" int g_ws_cam_guest_l1;
+extern "C" int g_ws_view_origin_x;
+extern "C" int g_ws_room_w;
+extern "C" int g_ws_block_top_peek;
+extern "C" int g_ws_player_screen_x;
+extern "C" int g_ws_player_screen_y;
+extern "C" unsigned g_ws_extra_top;
+extern "C" unsigned g_ws_extra_bottom;
+// Rows of sky above the status plate. The bar was flush with the top of
+// the tall view; this inset drops the plate, and the reserve icon with it.
+constexpr int kStatusTopMargin = 4;
+// The bar and the reserve item, in guest lines. Line 32 is already the
+// camera. Those lines are drawn once, at the top of the tall view.
+constexpr int kStatusBand = 32;
+// When nonzero, text-BG fetch in hy∈[0,status) blanks non-scenery tiles
+// so a second pass can erase the mid-screen status stamp after pin-to-top.
+extern "C" int g_ws_status_tile_scrub;
+// When nonzero and extra_top>0: after continuous render, redraw guest hy∈[0,band)
+// at oy=hy (status UI at FB top) and refill oy=hy+extra_top from peek
+// (hy-extra_top). Redraw from PPU state — not an FB row copy.
+extern "C" int g_ws_status_ui_pin;
+// When nonzero, render_scanline_wide skips guest OAM world sprites; the game's
+// post-latch host layer owns vertical placement (int32 display-list Y).
+extern "C" int g_ws_host_obj_compose;
 // Optional per-game interpretation of the 9-bit OBJ X field in expanded-view
 // rendering. Hardware-faithful signed decoding remains the default.
 extern "C" int (*g_ws_obj_x_provider)(int raw_x, int* out_x);
@@ -243,5 +298,14 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int oam_index,
                                             std::uint16_t attr1,
                                             std::uint16_t attr2,
                                             int* out_x);
+// Full signed screen Y for the same OAM slot. The guest stores only the
+// low byte; without this, Y ≥ 160 is folded by −256 into the playfield.
+extern "C" int (*g_ws_obj_y_provider)(int oam_index, std::uint16_t attr0,
+                                      int* out_y);
+// Host post-latch compose (SMW sprite/HUD layers). nullptr = no extra pass.
+extern "C" void (*g_ws_post_latch_hook)(std::uint8_t* fb, std::uint32_t w,
+                                         std::uint32_t h,
+                                         std::uint32_t extra_left,
+                                         std::uint32_t extra_top);
 
 }  // namespace gba

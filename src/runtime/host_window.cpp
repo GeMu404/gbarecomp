@@ -1125,13 +1125,14 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
         if (SDL_GetRendererInfo(b->renderer, &info) == 0) {
             std::fprintf(stderr,
                          "host_window: renderer=%s flags=0x%08x vsync=%s%s "
-                         "scaler=%s\n",
+                         "scaler=%s logical=%dx%d\n",
                          info.name ? info.name : "unknown",
                          static_cast<unsigned>(info.flags),
                          (info.flags & SDL_RENDERER_PRESENTVSYNC) ? "yes" : "no",
                          b->resize_driven_view ? " (adaptive)" : "",
                          b->sharp_filter ? "sharp"
-                         : b->linear_filter ? "linear" : "nearest");
+                         : b->linear_filter ? "linear" : "nearest",
+                         b->base_w, b->base_h);
             std::fflush(stderr);
         }
         log_display_mode(b->window, "open");

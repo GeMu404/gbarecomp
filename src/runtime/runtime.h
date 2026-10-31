@@ -56,6 +56,15 @@ struct RunOptions {
     void (*extended_view_init)(std::uint32_t extra_left,
                                std::uint32_t extra_right) = nullptr;
 
+    // Optional tall framebuffer (extra rows above/below the native 160). When
+    // tall_bottom_anchor is set and the horizontal view is expanded, the PPU
+    // uses extra_top=64 / extra_bottom=0 (SNES-tall bottom-anchored). Otherwise
+    // a wide view keeps the legacy symmetric 32/32 letterbox unless the
+    // explicit view_extra_* fields are nonzero.
+    bool tall_bottom_anchor = false;
+    std::uint16_t view_extra_top = 0;
+    std::uint16_t view_extra_bottom = 0;
+
     // This cartridge carries a solar sensor. Unlike the RTC there is no ROM
     // signature to detect one from, so it has to be declared. Games that leave
     // this false are unaffected; GBARECOMP_SOLAR still forces it on for

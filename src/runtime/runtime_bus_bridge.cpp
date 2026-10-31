@@ -454,9 +454,40 @@ extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
     if (io) runtime_resync_horizon();
 }
 
+// Player Y is 0x03003FD4. A jump or a slope that crosses one height
+// rewrites it by a full screen. Log that store's PC; the integrator
+// only moves a few pixels and stays quiet.
+static void watch_player_y(uint32_t addr, int new_y) {
+    if (addr != 0x03003FD4u && addr != 0x03003FD0u) return;
+    static int hits = 0;
+    if (hits >= 16) return;
+    int old_y = 0;
+    if (gbarecomp::g_active_bus) {
+        old_y = static_cast<int16_t>(
+            gbarecomp::g_active_bus->read16(addr));
+    }
+    int delta = new_y - old_y;
+    if (delta < 0) delta = -delta;
+    if (delta < 24) return;
+    ++hits;
+    const int speed = gbarecomp::g_active_bus
+        ? static_cast<int>(static_cast<int8_t>(
+              gbarecomp::g_active_bus->read8(
+                  addr == 0x03003FD4u ? 0x03003FADu : 0x03003FACu)))
+        : 0;
+    std::fprintf(stderr,
+                 "[smw:yjump] pc=%08x %s old=%d new=%d "
+                 "loaded=%d carry=%d speed=%d frame=%llu\n",
+                 g_cpu.R[15], addr == 0x03003FD4u ? "Y" : "X",
+                 old_y, new_y, static_cast<int>(g_cpu.R[2]),
+                 static_cast<int>(g_cpu.R[4]), speed,
+                 static_cast<unsigned long long>(g_runtime_vblank_starts));
+}
+
 extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    watch_player_y(addr, static_cast<int16_t>(val));
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write16(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
@@ -465,6 +496,17 @@ extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
 extern "C" void bus_write_u8(uint32_t addr, uint8_t val) {
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
+    if ((addr == 0x03003FD4u || addr == 0x03003FD5u) &&
+        gbarecomp::g_active_bus) {
+        const uint16_t old =
+            gbarecomp::g_active_bus->read16(0x03003FD4u);
+        uint16_t neu = old;
+        if (addr == 0x03003FD4u)
+            neu = static_cast<uint16_t>((old & 0xFF00u) | val);
+        else
+            neu = static_cast<uint16_t>((old & 0x00FFu) | (uint16_t(val) << 8));
+        watch_player_y(0x03003FD4u, static_cast<int16_t>(neu));
+    }
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write8(addr, val);
     ++g_idle_disturb_epoch;
     if (io) runtime_resync_horizon();
@@ -550,6 +592,19 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
             bus->io().run_timed_dma(2);
         }
         if (events.vblank_started) {
+            if (ppu->view_expanded() &&
+                (ppu->view_extra_top() != 0 || ppu->view_extra_bottom() != 0)) {
+                ppu->paint_vertical_margins(bus->io().read16(0x000),
+                                            bus->io().raw(),
+                                            bus->vram_ptr(),
+                                            bus->oam_ptr(),
+                                            bus->pal_ptr());
+            }
+            ppu->apply_status_ui_pin(bus->io().read16(0x000),
+                                     bus->io().raw(),
+                                     bus->vram_ptr(),
+                                     bus->oam_ptr(),
+                                     bus->pal_ptr());
             ppu->mark_framebuffer_latched();
             ++g_runtime_vblank_starts;
             bus->io().run_timed_dma(1);   // VBlank-timed DMA

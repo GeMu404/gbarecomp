@@ -722,6 +722,7 @@ void find_config_arg(int argc, char** argv, Args* args) {
              s == "--dump-png" || s == "--load-state" ||
              s == "--view-width" || s == "--widescreen" ||
              s == "--save" || s == "--save-path" ||
+             s == "--screen" || s == "--volume" || s == "--linear-filter" ||
              s == "--gyro-sensitivity" || s == "--sharp-filter" ||
              s == "--affine-filter") &&
             i + 1 < argc) {
@@ -1459,6 +1460,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         const ViewGeometry geometry = resolve_view_geometry(
             requested_width, opts.max_view_width, ws_wip_enabled,
             gba::GbaPpu::kMaxRenderWidth);
+        const ViewVerticalMargins vert = resolve_view_vertical_margins(
+            geometry.width > 240,
+            opts.tall_bottom_anchor,
+            opts.view_extra_top,
+            opts.view_extra_bottom);
         if (geometry.width == 240 && requested_width != 240 &&
             !ws_wip_enabled && opts.max_view_width <= 240 && !args.quiet) {
             std::fprintf(stderr,
@@ -1472,7 +1478,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 "game's validated maximum; clamping to %ux160\n",
                 requested_width, geometry.width);
         }
-        ppu.set_view_margins(geometry.extra_left, geometry.extra_right, 0, 0);
+        ppu.set_view_margins(geometry.extra_left, geometry.extra_right,
+                             vert.extra_top, vert.extra_bottom);
         args.view_width = static_cast<int>(ppu.render_width());
         g_ws_extra_left  = static_cast<unsigned>(ppu.view_extra_left());
         g_ws_extra_right = static_cast<unsigned>(ppu.view_extra_right());
@@ -2269,10 +2276,23 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             static_cast<int>(target),
             resize_view_enabled ? opts.max_resize_view_width : opts.max_view_width,
             false, gba::GbaPpu::kMaxRenderWidth);
-        if (geometry.width == ppu.render_width()) return false;
+        const ViewVerticalMargins vert = resolve_view_vertical_margins(
+            geometry.width > 240,
+            opts.tall_bottom_anchor,
+            opts.view_extra_top,
+            opts.view_extra_bottom);
+        const std::uint32_t new_height =
+            160u + vert.extra_top + vert.extra_bottom;
+        if (geometry.width == ppu.render_width() &&
+            new_height == ppu.render_height()) {
+            return false;
+        }
+        ppu.set_view_margins(geometry.extra_left, geometry.extra_right,
+                             vert.extra_top, vert.extra_bottom);
         if (!win.set_surface_size(static_cast<int>(geometry.width),
-                                  static_cast<int>(ppu.render_height()))) return false;
-        ppu.set_view_margins(geometry.extra_left, geometry.extra_right, 0, 0);
+                                  static_cast<int>(ppu.render_height()))) {
+            return false;
+        }
         args.view_width = static_cast<int>(ppu.render_width());
         g_ws_extra_left = static_cast<unsigned>(ppu.view_extra_left());
         g_ws_extra_right = static_cast<unsigned>(ppu.view_extra_right());
