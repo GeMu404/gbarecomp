@@ -2352,9 +2352,14 @@ int run_game(int argc, char** argv, const RunOptions& opts_in) {
         int drawable_w = 0;
         int drawable_h = 0;
         if (!win.drawable_size(&drawable_w, &drawable_h)) return false;
-        const std::uint32_t target = resize_driven_view_width(
-            drawable_w, drawable_h, opts.max_resize_view_width,
-            gba::GbaPpu::kMaxRenderWidth);
+        // A game that declares view_height/aspect owns its width: the view is
+        // that fixed shape and the window only letterboxes it. Otherwise the
+        // window aspect drives the width at native height.
+        const std::uint32_t target = opts.widescreen_view_width > 240
+            ? static_cast<std::uint32_t>(opts.widescreen_view_width)
+            : resize_driven_view_width(
+                  drawable_w, drawable_h, opts.max_resize_view_width,
+                  gba::GbaPpu::kMaxRenderWidth);
         if (target == ppu.render_width()) return false;
 
         if (!apply_runtime_view_width(target)) return false;
